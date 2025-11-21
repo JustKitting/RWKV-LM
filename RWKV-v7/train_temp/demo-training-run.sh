@@ -16,6 +16,7 @@ N_EMBD="768"
 #
 CTX_LEN="512" # !!! change magic_prime if you change ctx_len !!!
 PROJ_DIR="out/L"$N_LAYER"-D"$N_EMBD"-"$MODEL_TYPE # set output folder
+WANDB_PROJECT="$(basename "$PROJ_DIR")"
 #
 # !!! by default train.py will load the last .pth in PROJ_DIR, and continue training from it !!!
 # !!! so here we will REMOVE all previous checkpts in PROJ_DIR, so they won't be loaded !!!
@@ -49,7 +50,7 @@ GPU_PER_NODE=1 # number of GPUs per node
 #
 DS_BUCKET_MB=2 # set to 2 for consumer GPUs, set to 200 for A100 / H100 (affects speed & vram usage)
 #
-python train.py --load_model "0" --wandb "Test" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
+python train.py --load_model "0" --wandb "$WANDB_PROJECT" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
  --ctx_len $CTX_LEN --train_stage 3 --epoch_count 999999 --epoch_begin 0 \
  --data_file "data/minipile" --my_exit_tokens 1498226207 --magic_prime 2926181 \
  --num_nodes $N_NODE --micro_bsz $M_BSZ --n_layer $N_LAYER --n_embd $N_EMBD \

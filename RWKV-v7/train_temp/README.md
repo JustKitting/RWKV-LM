@@ -1,7 +1,5 @@
 ## HOW TO TRAIN RWKV-7 on MiniPile (1.5G tokens) ##
 
-**Simplified RWKV-7 training demo**: https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/train_temp/rwkv7_train_simplified.py
-
 For reference, use python 3.10+, torch 2.5+, cuda 12.5+, latest deepspeed, but **keep pytorch-lightning==1.9.5**
 
 ### Note: seems deepspeed 0.17.x is buggy (worse loss or divergence). Use 0.16.8 for reference (maybe --layerwise_lr 0 can fix it)
@@ -45,6 +43,19 @@ RWKV-7 is the whole model with carefully set stuffs, including different init / 
 But the price to pay is there is no good simple "RWKV-7 layer" because a pytorch layer can't make sure itself is using correct init and hyperparameters.
 
 So if you need to use RWKV-7 for another task, please study train_temp code (only several hundred lines) and change it to suit you.
+
+### Training on The Pile (streaming JSONL)
+
+If you already have the EleutherAI Pile shards as `.jsonl.zst` files (for example under `/mnt/TrainingData/Training/EleutherAI_ThePile_v1/pile/train`), you can launch the RWKV-7 Pile recipes directly without converting to binidx. The helper scripts `demo-training-prepare-v7-pile.sh` and `demo-training-run-v7-pile.sh` now default to that location and use the streaming dataloader. Adjust the `DATA_ROOT` variable in each script if your copy of the dataset lives elsewhere. The scripts will also check that the tokenizer vocabulary (`../rwkv_vocab_v20230424.txt`) is available before starting.
+
+#### 0.36B training recipe (Chinchilla aligned)
+
+- Scripts now target a ~0.36 B parameter RWKV-7 (18 layers × 1024 width, `ctx_len=4096`). The output directory defaults to `out/L18-D1024-x070` so the larger experiments remain untouched.
+- Stage 1 (`demo-training-prepare-v7-pile.sh`) streams The Pile, builds an initial checkpoint with `micro_bsz=1`, bf16 precision, and gradient checkpointing enabled to keep memory low during the one-off init pass.
+- Stage 2 (`demo-training-run-v7-pile.sh`) runs from scratch with `micro_bsz=24`, `ctx_len=4096`, and `epoch_steps=1000`. With 80 mini-epochs this covers ≈7.9 B tokens (`4096 × 24 × 1000 × 80`), matching the Chinchilla guideline of ~20 tokens per parameter.
+- Warmup spans 1500 steps and the optimizer uses `(β₁, β₂) = (0.9, 0.997)`. Checkpoints drop every 5 mini-epochs (~0.49 B tokens). DeepSpeed bucket sizes stay at 200 MB to keep communication efficient.
+- The tokenizer remains `rwkv_vocab_v20230424.txt` (≈65 k entries); consequently both scripts set `--vocab_size 65536`.
+- After training you can sample using `tools/generate.py`; it now defaults to the 18×1024, `ctx_len=4096` configuration and pads sequences to keep the CUDA kernel happy.
 
 RWKV-7 weight example for 1.5B (L24-D2048, vocab 65536):
 | name                | shape         | comment      | initialization  |

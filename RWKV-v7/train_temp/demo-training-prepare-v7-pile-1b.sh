@@ -1,7 +1,7 @@
 #!/bin/bash
 #######################################################################################################################
 #
-# This will generate the initial model, and save it to the output folder
+# This will generate the initial model weights for the ~1.0B parameter RWKV-7 configuration on The Pile
 #
 # Requires the EleutherAI Pile shards (.jsonl.zst) under /mnt/TrainingData/Training/EleutherAI_ThePile_v1/pile/train
 # Adjust DATA_ROOT if your dataset lives elsewhere.
@@ -10,10 +10,10 @@
 #
 MODEL_TYPE="x070" # x070 => rwkv-7.0
 #
-N_LAYER="18"
-N_EMBD="1024"
+N_LAYER="22"
+N_EMBD="1536"
 #
-CTX_LEN="4096" # ~0.36B parameter configuration
+CTX_LEN="4096" # keep the same context length as the base recipe
 PROJ_DIR="out/L"$N_LAYER"-D"$N_EMBD"-"$MODEL_TYPE # set output folder
 #
 #######################################################################################################################

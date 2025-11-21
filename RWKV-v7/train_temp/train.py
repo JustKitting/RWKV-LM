@@ -7,9 +7,19 @@ logging.basicConfig(level=logging.INFO)
 
 if __name__ == "__main__":
     from argparse import ArgumentParser
-    from pytorch_lightning import Trainer
     from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
     import pytorch_lightning as pl
+    from pytorch_lightning import Trainer
+
+    def str2bool(v):
+        if isinstance(v, bool):
+            return v
+        v = str(v).strip().lower()
+        if v in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "f", "no", "n", "off"}:
+            return False
+        raise ValueError(f"Cannot interpret '{v}' as boolean")
 
     rank_zero_info("########## work in progress ##########")
 
@@ -17,22 +27,66 @@ if __name__ == "__main__":
 
     parser.add_argument("--load_model", default="", type=str)  # full path, with .pth
     parser.add_argument("--wandb", default="", type=str)  # wandb project name. if "" then don't use wandb
+    parser.add_argument("--wandb_api_key", default="", type=str)  # HERE supply a key to auto-login; project defaults to RWKV when provided
     parser.add_argument("--proj_dir", default="out", type=str)
     parser.add_argument("--random_seed", default="-1", type=int)
 
-    parser.add_argument("--data_file", default="", type=str)
-    parser.add_argument("--data_type", default="utf-8", type=str)
+    parser.add_argument("--data_file", default="", type=str)  # HERE set to binidx prefix or streaming data root
+    parser.add_argument("--data_type", default="binidx", type=str)  # choose between "binidx", "stream_jsonl", "stream_parquet"
     parser.add_argument("--vocab_size", default=0, type=int)  # vocab_size = 0 means auto (for char-level LM and .txt data)
+    parser.add_argument("--tokenizer_path", default="", type=str)  # HERE only needed for streaming loader; leave blank for binidx
+    parser.add_argument("--stream_pattern", default="train/*.jsonl.zst", type=str)  # HERE glob used by streaming loader
+    parser.add_argument("--stream_text_key", default="text", type=str)
+    parser.add_argument("--stream_separator", default="\n\n", type=str)  # HERE separator appended between docs when streaming
+    parser.add_argument("--stream_shuffle_buffer", default=256, type=int)  # HERE tweak buffer for datasets.shuffle in streaming mode
+    parser.add_argument("--stream_parquet_text_fields", default="synthetic_answer", type=str,
+                        help="Comma-separated parquet columns to concatenate for LM training")
+    parser.add_argument("--use_flat_norm", default=0, type=int)  # use custom flat-space normalization
+    parser.add_argument("--use_flat_norm_full", default=0, type=int)  # replace internal norms as well
 
-    parser.add_argument("--ctx_len", default=1024, type=int)
+    parser.add_argument("--kl_eval_text", default="", type=str,
+                        help="Optional text file for per-epoch KL divergence evaluation")
+    parser.add_argument("--kl_eval_stride", default=0, type=int,
+                        help="Stride between KL evaluation windows (0 defaults to ctx_len)")
+    parser.add_argument("--kl_eval_batch_size", default=1, type=int,
+                        help="Batch size for KL evaluation windows")
+    parser.add_argument("--kl_eval_max_windows", default=256, type=int,
+                        help="Maximum number of KL windows per evaluation (0 = use all)")
+    parser.add_argument("--kl_eval_data_file", default="", type=str,
+                        help="Optional streaming dataset (jsonl/parquet) for KL evaluation")
+    parser.add_argument("--kl_eval_data_type", default="", type=str,
+                        help="KL dataset type: stream_jsonl or stream_parquet")
+    parser.add_argument("--kl_eval_stream_pattern", default="", type=str,
+                        help="Glob pattern for KL streaming dataset when data_file is a directory")
+    parser.add_argument("--kl_eval_stream_text_key", default="", type=str,
+                        help="Text field name for KL JSON streaming dataset")
+    parser.add_argument("--kl_eval_parquet_text_fields", default="", type=str,
+                        help="Comma separated text columns for KL parquet streaming dataset")
+    parser.add_argument("--kl_eval_stream_separator", default="", type=str,
+                        help="Text separator used when concatenating KL streaming fields")
+
+    parser.add_argument("--mmlu_eval", default=False, type=str2bool,
+                        help="Run MMLU evaluation after each checkpoint save")
+    parser.add_argument("--mmlu_eval_dataset_root", default="", type=str,
+                        help="Root directory containing mmlu_*_dataset folders")
+    parser.add_argument("--mmlu_eval_use_dev", default=False, type=str2bool,
+                        help="Also evaluate on the MMLU dev split")
+    parser.add_argument("--mmlu_eval_max_samples", default=0, type=int,
+                        help="Limit MMLU evaluation to this many samples (0 = all)")
+    parser.add_argument("--mmlu_eval_shuffle", default=False, type=str2bool,
+                        help="Shuffle MMLU samples before limiting")
+    parser.add_argument("--mmlu_eval_seed", default=42, type=int,
+                        help="Seed used when shuffling MMLU samples")
+
+    parser.add_argument("--ctx_len", default=1024, type=int)  # HERE adjust context length to match dataset + desired receptive field
     parser.add_argument("--epoch_steps", default=1000, type=int)  # a mini "epoch" has [epoch_steps] steps
     parser.add_argument("--epoch_count", default=500, type=int)  # train for this many "epochs". will continue afterwards with lr = lr_final
     parser.add_argument("--epoch_begin", default=0, type=int)  # if you load a model trained for x "epochs", set epoch_begin = x
     parser.add_argument("--epoch_save", default=5, type=int)  # save the model every [epoch_save] "epochs"
 
     parser.add_argument("--micro_bsz", default=12, type=int)  # micro batch size (batch size per GPU)
-    parser.add_argument("--n_layer", default=6, type=int)
-    parser.add_argument("--n_embd", default=512, type=int)
+    parser.add_argument("--n_layer", default=6, type=int)  # HERE tune depth to hit ~100M params (try 12-16 layers when n_embd ~640)
+    parser.add_argument("--n_embd", default=512, type=int)  # HERE tune width; lowering reduces params & VRAM
     parser.add_argument("--dim_att", default=0, type=int)
     parser.add_argument("--dim_ffn", default=0, type=int)
 
@@ -49,18 +103,33 @@ if __name__ == "__main__":
     parser.add_argument("--train_stage", default=0, type=int)  # my special pile mode
     parser.add_argument("--ds_bucket_mb", default=200, type=int)  # deepspeed bucket size in MB. 200 seems enough
 
+    parser.add_argument("--accelerator", default="auto", type=str)
+    parser.add_argument("--devices", default=1, type=int)
+    parser.add_argument("--num_nodes", default=1, type=int)
+    parser.add_argument("--precision", default="bf16", type=str)
+    parser.add_argument("--strategy", default="auto", type=str)
+    parser.add_argument("--enable_progress_bar", default=False, type=str2bool)
+    parser.add_argument("--limit_train_batches", default=1.0, type=float)
+    parser.add_argument("--accumulate_grad_batches", default=1, type=int)
+    parser.add_argument("--max_steps", default=-1, type=int)
+    parser.add_argument("--max_time", default="", type=str)
+    parser.add_argument("--warp_monitor", default=False, type=str2bool,
+                        help="Collect floating-point curvature statistics during training")
+
     parser.add_argument("--head_size", default=64, type=int) # can try larger values for larger models
     parser.add_argument("--load_partial", default=0, type=int)
     parser.add_argument("--magic_prime", default=0, type=int)
     parser.add_argument("--my_testing", default='x070', type=str)
     parser.add_argument("--my_exit_tokens", default=0, type=int)
 
-    parser = Trainer.add_argparse_args(parser)
     args = parser.parse_args()
+    args.use_flat_norm = bool(args.use_flat_norm)
+    args.use_flat_norm_full = bool(args.use_flat_norm_full)
 
     ########################################################################################################
 
     import os, warnings, math, datetime, sys, time
+    from pathlib import Path
     import numpy as np
     import torch
     from torch.utils.data import DataLoader
@@ -72,20 +141,22 @@ if __name__ == "__main__":
         print(f"########## WARNING: GLOBAL SEED {args.random_seed} THIS WILL AFFECT MULTIGPU SAMPLING ##########\n" * 3)
         seed_everything(args.random_seed)
 
+    if args.accelerator == "gpu" and not torch.cuda.is_available():
+        rank_zero_info("No GPU detected. Falling back to CPU accelerator.")
+        args.accelerator = "cpu"
+        args.devices = 1
+        if args.precision.lower() in {"bf16", "bf16-mixed", "fp16", "16", "16-mixed"}:
+            args.precision = "fp32"
+        if isinstance(args.strategy, str) and args.strategy.startswith("deepspeed"):
+            args.strategy = "auto"
+        args.grad_cp = 0
+
     np.set_printoptions(precision=4, suppress=True, linewidth=200)
     warnings.filterwarnings("ignore", ".*Consider increasing the value of the `num_workers` argument*")
     warnings.filterwarnings("ignore", ".*The progress bar already tracks a metric with the*")
     # os.environ["WDS_SHOW_SEED"] = "1"
 
     args.my_timestamp = datetime.datetime.today().strftime("%Y-%m-%d-%H-%M-%S")
-    args.enable_checkpointing = False
-    args.replace_sampler_ddp = False
-    args.logger = False
-    args.gradient_clip_val = args.grad_clip
-    args.num_sanity_val_steps = 0
-    args.check_val_every_n_epoch = int(1e20)
-    args.log_every_n_steps = int(1e20)
-    args.max_epochs = -1  # continue forever
     args.betas = (args.beta1, args.beta2)
     args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
     os.environ["RWKV_MY_TESTING"] = args.my_testing
@@ -96,13 +167,24 @@ if __name__ == "__main__":
     if args.dim_ffn <= 0:
         args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32) # default = 3.5x emb size
 
+    if len(args.wandb) == 0 and len(args.wandb_api_key) > 0:
+        args.wandb = "RWKV"  # HERE default project when key supplied
+
     args.run_name = f"{args.vocab_size} ctx{args.ctx_len} L{args.n_layer} D{args.n_embd}"
     if not os.path.exists(args.proj_dir):
         os.makedirs(args.proj_dir)
 
-    args.epoch_count = args.magic_prime // 40320
-    args.epoch_steps = 40320 // args.real_bsz
-    assert args.epoch_steps * args.real_bsz == 40320
+    if args.data_type == 'binidx':
+        args.epoch_count = args.magic_prime // 40320
+        args.epoch_steps = 40320 // args.real_bsz
+        assert args.epoch_steps * args.real_bsz == 40320
+    else:
+        if args.epoch_steps <= 0:
+            raise ValueError("For streaming data, explicitly set --epoch_steps > 0")
+
+    os.environ["RWKV_USE_DEEPSPEED"] = (
+        "1" if isinstance(args.strategy, str) and args.strategy.startswith("deepspeed") else "0"
+    )
 
     if args.train_stage >= 2:  # find latest saved model
         list_p = []
@@ -116,7 +198,13 @@ if __name__ == "__main__":
                         p = int(p)
                     list_p += [p]
         list_p.sort()
-        max_p = list_p[-1]
+        if len(list_p) == 0:
+            rank_zero_info("No existing checkpoint found in proj_dir; will start from fresh init.")
+            args.load_model = ""
+            max_p = -1
+            args.my_pile_prev_p = -1
+        else:
+            max_p = list_p[-1]
         if len(list_p) > 1:
             args.my_pile_prev_p = list_p[-2]  # in case max_p is corrupted
         if max_p == -1:
@@ -159,7 +247,7 @@ if __name__ == "__main__":
     )
     rank_zero_info(str(vars(args)) + "\n")
 
-    assert args.data_type in ["binidx"]
+    assert args.data_type in ["binidx", "stream_jsonl", "stream_parquet"]
 
     if args.lr_final == 0 or args.lr_init == 0:
         rank_zero_info("\n\nNote: lr_final = 0 or lr_init = 0. Using linear LR schedule instead.\n\n")
@@ -185,25 +273,42 @@ if __name__ == "__main__":
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    if "32" in args.precision:
-        args.precision = 32
-    elif args.precision == "fp16":
-        args.precision = 16
+    precision_setting = args.precision
+    if isinstance(precision_setting, str):
+        precision_setting = precision_setting.lower()
+    if isinstance(precision_setting, str) and "32" in precision_setting:
+        precision_setting = 32
+    elif precision_setting == "fp16":
+        precision_setting = 16
+    elif precision_setting in ("bf16", "bf16-mixed"):
+        precision_setting = "bf16"
     else:
-        args.precision = "bf16"
+        precision_setting = 32
 
     ########################################################################################################
 
     from src.trainer import train_callback, generate_init_weight
+    from pytorch_lightning.loggers import TensorBoardLogger
     from src.dataset import MyDataset
 
-    train_data = MyDataset(args)
+    train_data = MyDataset(args)  # HERE swap in a custom Dataset impl if you convert The Pile differently
     args.vocab_size = train_data.vocab_size
 
     from src.model import RWKV
     model = RWKV(args)
 
-    if len(args.load_model) == 0 or args.train_stage == 1:  # shall we build the initial weights?
+    warp_monitor = None
+    if args.warp_monitor:
+        from src.warp_monitor import WarpMonitor
+
+        monitor_path = Path(args.proj_dir) / "warp_metrics.jsonl"
+        warp_monitor = WarpMonitor(monitor_path)
+        warp_monitor.install(model, module_names=[])
+        args._warp_monitor = warp_monitor
+    else:
+        args._warp_monitor = None
+
+    if len(args.load_model) == 0 or not os.path.isfile(args.load_model) or args.train_stage == 1:  # shall we build the initial weights?
         init_weight_name = f"{args.proj_dir}/rwkv-init.pth"
         generate_init_weight(model, init_weight_name)  # save initial weights
         args.load_model = init_weight_name
@@ -219,7 +324,7 @@ if __name__ == "__main__":
     except:
         rank_zero_info(f"Bad checkpoint {args.load_model}")
         if args.train_stage >= 2:  # try again using another checkpoint
-            max_p = args.my_pile_prev_p
+            max_p = getattr(args, "my_pile_prev_p", -1)
             if max_p == -1:
                 args.load_model = f"{args.proj_dir}/rwkv-init.pth"
             else:
@@ -235,10 +340,43 @@ if __name__ == "__main__":
                 load_dict[k] = model.state_dict()[k]
     model.load_state_dict(load_dict)
 
-    trainer = Trainer.from_argparse_args(
-        args,
+    max_steps = None if args.max_steps is None or args.max_steps < 0 else args.max_steps
+    max_time = None if len(args.max_time.strip()) == 0 else args.max_time
+
+    tb_logger = None
+    try:
+        tb_logger = TensorBoardLogger(
+            save_dir=args.proj_dir,
+            name="tb",
+            version="",
+            default_hp_metric=False,
+        )
+    except ModuleNotFoundError as tb_err:
+        rank_zero_info(f"TensorBoard logger disabled: {tb_err}")
+
+    trainer_kwargs = dict(
+        accelerator=args.accelerator,
+        devices=args.devices,
+        num_nodes=args.num_nodes,
+        strategy=args.strategy,
+        precision=precision_setting,
+        enable_checkpointing=False,
+        logger=tb_logger,
+        enable_progress_bar=args.enable_progress_bar,
         callbacks=[train_callback(args)],
+        gradient_clip_val=args.grad_clip,
+        num_sanity_val_steps=0,
+        check_val_every_n_epoch=int(1e20),
+        log_every_n_steps=int(1e20),
+        limit_train_batches=args.limit_train_batches,
+        accumulate_grad_batches=args.accumulate_grad_batches,
     )
+    if max_steps is not None:
+        trainer_kwargs["max_steps"] = max_steps
+    if max_time is not None:
+        trainer_kwargs["max_time"] = max_time
+
+    trainer = Trainer(**trainer_kwargs)
 
     if trainer.global_rank == 0:
         for n in model.state_dict():
@@ -259,3 +397,6 @@ if __name__ == "__main__":
     if trainer.global_rank == 0:
         print(f'### Preparing for training (loaded {args.load_model}). Please wait...')
     trainer.fit(model, data_loader)
+
+    if warp_monitor is not None:
+        warp_monitor.close()

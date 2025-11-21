@@ -5,13 +5,34 @@
 import os, math, gc, importlib
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as torch_checkpoint
+from torch.optim import AdamW
 from torch.nn import functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 from pytorch_lightning.strategies import DeepSpeedStrategy
-if importlib.util.find_spec('deepspeed'):
+
+_USE_DEEPSPEED = os.environ.get("RWKV_USE_DEEPSPEED", "0") == "1"
+if _USE_DEEPSPEED and importlib.util.find_spec('deepspeed'):
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+else:
+    deepspeed = None
+    DeepSpeedCPUAdam = None
+    FusedAdam = None
+
+
+class AdamWWithScale(AdamW):
+    def __init__(self, param_groups, *args, **kwargs):
+        stored_scales = []
+        cleaned_groups = []
+        for group in param_groups:
+            group = dict(group)
+            stored_scales.append(group.pop("my_lr_scale", 1.0))
+            cleaned_groups.append(group)
+        super().__init__(cleaned_groups, *args, **kwargs)
+        for pg, scale in zip(self.param_groups, stored_scales):
+            pg["my_lr_scale"] = scale
 
 try:
     print('RWKV_MY_TESTING', os.environ["RWKV_MY_TESTING"])
@@ -33,11 +54,20 @@ if os.environ["RWKV_JIT_ON"] == "1":
 # CUDA Kernel
 ########################################################################################################
 
-from torch.utils.cpp_extension import load
+from torch.utils.cpp_extension import load, CUDA_HOME
+
+from .flatnorm import FlatSpaceNorm, FlatSpaceGroupNorm
 
 HEAD_SIZE = int(os.environ["RWKV_HEAD_SIZE"])
 
-if 'x070' in os.environ["RWKV_MY_TESTING"]:
+_can_build_cuda = (
+    'x070' in os.environ["RWKV_MY_TESTING"]
+    and torch.cuda.is_available()
+    and CUDA_HOME is not None
+    and os.environ.get("RWKV_FORCE_CPU_KERNEL", "0") != "1"
+)
+
+if _can_build_cuda:
     CHUNK_LEN = 16
 
     flags = ['-res-usage', f'-D_C_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
@@ -69,6 +99,26 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
         B,T,HC = q.shape
         q,w,k,v,a,b = [i.view(B,T,HC//64,64) for i in [q,w,k,v,a,b]]
         return WindBackstepping.apply(w,q,k,v,a,b).view(B,T,HC)
+
+else:
+    # CPU fallback: use a differentiable attention-style approximation when CUDA kernel is unavailable.
+    def RUN_CUDA_RWKV7g(q, w, k, v, a, b):
+        B, T, HC = q.shape
+        qf = q.to(torch.float32)
+        kf = k.to(torch.float32)
+        vf = v.to(torch.float32)
+        af = a.to(torch.float32)
+        bf = b.to(torch.float32)
+        wf = w.to(torch.float32)
+        scale = 1.0 / math.sqrt(max(HC, 1))
+
+        attn_logits = torch.einsum('btc,ptc->btp', qf, kf) * scale
+        attn = torch.softmax(attn_logits, dim=-1)
+        context = torch.einsum('btp,ptc->btc', attn, vf)
+
+        gate = torch.sigmoid(wf + bf)
+        out = (context + af) * gate
+        return out.to(q.dtype).contiguous()
 
 ########################################################################################################
 
@@ -152,6 +202,9 @@ class RWKV_Tmix_x070(MyModule):
             self.key = nn.Linear(C, C, bias=False)
             self.value = nn.Linear(C, C, bias=False)
             self.output = nn.Linear(C, C, bias=False)
+        if getattr(args, "use_flat_norm_full", False):
+            self.ln_x = FlatSpaceGroupNorm(H, C, eps=64e-5)
+        else:
             self.ln_x = nn.GroupNorm(H, C, eps=64e-5) # !!! notice eps value !!!
 
             self.receptance.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
@@ -186,6 +239,14 @@ class RWKV_Tmix_x070(MyModule):
         kk = k * self.k_k
         kk = F.normalize(kk.view(B,T,H,-1), dim=-1, p=2.0).view(B,T,C)
         k = k * (1 + (a-1) * self.k_a)
+
+        # Ensure kernel inputs are bf16 even if upstream ops promoted them
+        r = r.to(torch.bfloat16)
+        w = w.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+        kk = kk.to(torch.bfloat16)
+        a = a.to(torch.bfloat16)
 
         x = RUN_CUDA_RWKV7g(r, w, k, v, -kk, kk*a)
         x = self.ln_x(x.view(B * T, C)).view(B, T, C)
@@ -236,11 +297,16 @@ class Block(nn.Module):
         self.args = args
         self.layer_id = layer_id
 
-        self.ln1 = nn.LayerNorm(args.n_embd)
-        self.ln2 = nn.LayerNorm(args.n_embd)
-
-        if self.layer_id == 0:
-            self.ln0 = nn.LayerNorm(args.n_embd)
+        if args.use_flat_norm:
+            self.ln1 = FlatSpaceNorm(args.n_embd)
+            self.ln2 = FlatSpaceNorm(args.n_embd)
+            if self.layer_id == 0:
+                self.ln0 = FlatSpaceNorm(args.n_embd)
+        else:
+            self.ln1 = nn.LayerNorm(args.n_embd)
+            self.ln2 = nn.LayerNorm(args.n_embd)
+            if self.layer_id == 0:
+                self.ln0 = nn.LayerNorm(args.n_embd)
 
         self.att = RWKV_Tmix_x070(args, layer_id)
         self.ffn = RWKV_CMix_x070(args, layer_id)
@@ -249,10 +315,28 @@ class Block(nn.Module):
         if self.layer_id == 0:
             x = self.ln0(x)
 
-        x_attn, v_first = self.att(self.ln1(x), v_first)
+        ln1_x = self.ln1(x)
+        monitor = getattr(self.args, "_warp_monitor", None)
+        if monitor is not None:
+            monitor.record_pre(f"blocks.{self.layer_id}.att", ln1_x)
+
+        x_attn, v_first = self.att(ln1_x, v_first)
+
+        if monitor is not None:
+            monitor.record_post(f"blocks.{self.layer_id}.att", x_attn)
+
         x = x + x_attn
 
-        x = x + self.ffn(self.ln2(x))
+        ln2_x = self.ln2(x)
+        if monitor is not None:
+            monitor.record_pre(f"blocks.{self.layer_id}.ffn", ln2_x)
+
+        ffn_out = self.ffn(ln2_x)
+
+        if monitor is not None:
+            monitor.record_post(f"blocks.{self.layer_id}.ffn", ffn_out)
+
+        x = x + ffn_out
         return x, v_first
 
 
@@ -277,6 +361,10 @@ class RWKV(pl.LightningModule):
     def __init__(self, args):
         super().__init__()
         self.args = args
+        if not hasattr(args, 'use_flat_norm'):
+            args.use_flat_norm = False
+        if not hasattr(args, 'use_flat_norm_full'):
+            args.use_flat_norm_full = False
         if not hasattr(args, 'dim_att'):
             args.dim_att = args.n_embd
         if not hasattr(args, 'dim_ffn'):
@@ -289,7 +377,10 @@ class RWKV(pl.LightningModule):
 
         self.blocks = nn.ModuleList([Block(args, i) for i in range(args.n_layer)])
 
-        self.ln_out = nn.LayerNorm(args.n_embd)
+        if args.use_flat_norm:
+            self.ln_out = FlatSpaceNorm(args.n_embd)
+        else:
+            self.ln_out = nn.LayerNorm(args.n_embd)
         self.head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
 
     def configure_optimizers(self):
@@ -324,13 +415,38 @@ class RWKV(pl.LightningModule):
 
         if args.weight_decay > 0:
             optim_groups += [{"params": [param_dict[n] for n in lr_decay], "weight_decay": args.weight_decay, "my_lr_scale": 1.0}]
-            if self.deepspeed_offload:
-                return DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=True, amsgrad=False)
-            return FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=True, amsgrad=False)
-        else:
-            if self.deepspeed_offload:
-                return DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=False, weight_decay=0, amsgrad=False)
-            return FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=False, weight_decay=0, amsgrad=False)
+
+        if self.deepspeed_offload and DeepSpeedCPUAdam is not None:
+            return DeepSpeedCPUAdam(
+                optim_groups,
+                lr=self.args.lr_init,
+                betas=self.args.betas,
+                eps=self.args.adam_eps,
+                bias_correction=True,
+                adamw_mode=args.weight_decay > 0,
+                weight_decay=0 if args.weight_decay <= 0 else args.weight_decay,
+                amsgrad=False,
+            )
+
+        if not self.deepspeed_offload and FusedAdam is not None:
+            return FusedAdam(
+                optim_groups,
+                lr=self.args.lr_init,
+                betas=self.args.betas,
+                eps=self.args.adam_eps,
+                bias_correction=True,
+                adam_w_mode=args.weight_decay > 0,
+                weight_decay=0 if args.weight_decay <= 0 else args.weight_decay,
+                amsgrad=False,
+            )
+
+        return AdamWWithScale(
+            optim_groups,
+            lr=self.args.lr_init,
+            betas=self.args.betas,
+            eps=self.args.adam_eps,
+            weight_decay=0.0,
+        )
 
     @property
     def deepspeed_offload(self) -> bool:
@@ -350,7 +466,10 @@ class RWKV(pl.LightningModule):
         v_first = torch.empty_like(x)
         for block in self.blocks:
             if args.grad_cp == 1:
-                x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
+                if deepspeed is not None and hasattr(deepspeed, "checkpointing"):
+                    x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
+                else:
+                    x, v_first = torch_checkpoint.checkpoint(block, x, v_first, use_reentrant=False)
             else:
                 x, v_first = block(x, v_first)
 

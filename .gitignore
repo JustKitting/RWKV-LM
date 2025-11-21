@@ -11,6 +11,14 @@ vocab.json
 test/
 tools/
 
+# RWKV-v7 training artifacts
+RWKV-v7/train_temp/out/
+RWKV-v7/train_temp/wandb/
+RWKV-v7/train_temp/**/*.wandb
+RWKV-v7/train_temp/**/*.tfevents.*
+RWKV-v7/train_temp/*.nsys-rep
+RWKV-v7/train_temp/*.sqlite
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
